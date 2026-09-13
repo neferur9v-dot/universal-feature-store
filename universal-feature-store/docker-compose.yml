@@ -1,0 +1,317 @@
+version: '3.8'
+
+services:
+  # ==================== INFRASTRUCTURE LEVEL ====================
+  
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: "2181"
+      ZOOKEEPER_TICK_TIME: "2000"
+    ports:
+      - "2181:2181"
+    networks:
+      - ufs-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: "1"
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - ufs-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - ufs-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: "minioadmin"
+      MINIO_ROOT_PASSWORD: "minioadmin"
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - ufs-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mlflow:
+    image: python:3.10-slim
+    container_name: mlflow
+    working_dir: /mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_TRACKING_URI: "http://localhost:5000"
+      AWS_ACCESS_KEY_ID: "minioadmin"
+      AWS_SECRET_ACCESS_KEY: "minioadmin"
+      AWS_DEFAULT_REGION: "us-east-1"
+    command: >
+      bash -c "pip install mlflow boto3 && 
+               mlflow server --host 0.0.0.0 --port 5000 
+               --default-artifact-root s3://mlflow-artifacts/ 
+               --backend-store-uri sqlite:///mlflow.db"
+    volumes:
+      - mlflow-data:/mlflow
+    networks:
+      - ufs-network
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # ==================== PROCESSING LEVEL ====================
+  
+  flink-jobmanager:
+    image: apache/flink:1.17-py3.9
+    container_name: flink-jobmanager
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        rest.flamegraph.enabled: true
+    volumes:
+      - ./src/processor:/opt/flink/usrlib
+    networks:
+      - ufs-network
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  flink-taskmanager:
+    image: apache/flink:1.17-py3.9
+    container_name: flink-taskmanager
+    depends_on:
+      flink-jobmanager:
+        condition: service_started
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 4
+    volumes:
+      - ./src/processor:/opt/flink/usrlib
+    networks:
+      - ufs-network
+
+  feast-online-server:
+    image: python:3.10-slim
+    container_name: feast-online-server
+    working_dir: /feast
+    ports:
+      - "6566:6566"
+    command: >
+      bash -c "pip install feast redis fastapi uvicorn &&
+               feast serve --host 0.0.0.0 --port 6566"
+    volumes:
+      - ./feature_repo:/feast
+    networks:
+      - ufs-network
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ==================== APPLICATION LEVEL ====================
+  
+  api-server:
+    build:
+      context: .
+      dockerfile: deploy/api/Dockerfile
+    container_name: api-server
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      KAFKA_BROKER: "kafka:29092"
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+      FEAST_SERVING_HOST: "feast-online-server:6566"
+    volumes:
+      - ./src:/app/src
+      - ./config:/app/config
+    networks:
+      - ufs-network
+    depends_on:
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+      feast-online-server:
+        condition: service_started
+
+  trainer:
+    build:
+      context: .
+      dockerfile: deploy/trainer/Dockerfile
+    container_name: trainer
+    environment:
+      MINIO_ENDPOINT: "minio:9000"
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+      AWS_ACCESS_KEY_ID: "minioadmin"
+      AWS_SECRET_ACCESS_KEY: "minioadmin"
+    volumes:
+      - ./src/ml:/app/src/ml
+      - ./config:/app/config
+    networks:
+      - ufs-network
+    depends_on:
+      minio:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+
+  drift-detector:
+    build:
+      context: .
+      dockerfile: deploy/drift-detector/Dockerfile
+    container_name: drift-detector
+    environment:
+      MINIO_ENDPOINT: "minio:9000"
+      REDIS_HOST: "redis"
+    volumes:
+      - ./src/monitoring:/app/src/monitoring
+    networks:
+      - ufs-network
+    depends_on:
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ==================== SIMULATION LEVEL ====================
+  
+  telemetry-daemon:
+    build:
+      context: ./imitators/cpp_qt5
+      dockerfile: Dockerfile.daemon
+    container_name: telemetry-daemon
+    environment:
+      KAFKA_BROKER: "kafka:29092"
+    networks:
+      - ufs-network
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  init-job:
+    build:
+      context: .
+      dockerfile: deploy/init/Dockerfile
+    container_name: init-job
+    environment:
+      KAFKA_BROKER: "kafka:29092"
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+      REDIS_HOST: "redis"
+    volumes:
+      - ./scripts:/app/scripts
+      - ./config:/app/config
+    networks:
+      - ufs-network
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    command: >
+      bash -c "echo 'Waiting for services...' && 
+               sleep 15 &&
+               ./scripts/init_kafka.sh &&
+               ./scripts/init_feast.sh &&
+               ./scripts/init_mlflow.sh &&
+               echo 'Initialization complete'"
+
+  # ==================== MONITORING LEVEL ====================
+  
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    networks:
+      - ufs-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: "admin"
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards
+    networks:
+      - ufs-network
+    depends_on:
+      prometheus:
+        condition: service_started
+
+networks:
+  ufs-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+  minio-data:
+  mlflow-data:
+  prometheus-data:
+  grafana-data:
